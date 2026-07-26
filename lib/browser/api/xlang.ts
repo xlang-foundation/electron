@@ -1,6 +1,6 @@
 import { createXLangFacade } from '@electron/internal/browser/api/xlang-remote';
 
-import * as path from 'node:path';
+import * as path from 'path';
 
 const { xlang: native } = process._linkedBinding('electron_browser_xlang');
 
