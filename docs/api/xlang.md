@@ -209,6 +209,7 @@ event handles automatically when an event is canceled before delivery.
 * `listener` Function (optional) - Previously registered listener. When
   omitted, all listeners registered through this proxy for `eventName` are
   removed.
+  * `event` [XLangEvent](structures/xlang-event.md)
 
 Returns `Promise<void>` - Resolves after matching native event subscriptions
 are removed.
