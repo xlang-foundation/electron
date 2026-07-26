@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "base/compiler_specific.h"
+#include "base/containers/span.h"
 #include "base/files/file_path.h"
 #include "base/files/file_util.h"
 #include "base/functional/bind.h"
@@ -154,8 +156,11 @@ OwnedBridgeValue CopyBridgeValue(const xlang_bridge_value* value) {
       const auto view = value->data.bytes_value;
       if (view.data && view.size <= static_cast<uint64_t>(
                                         std::numeric_limits<size_t>::max())) {
-        copy.bytes.assign(view.data,
-                          view.data + static_cast<size_t>(view.size));
+        // SAFETY: The bridge owns this buffer for the duration of the callback
+        // and the ABI supplies its validated byte length.
+        const auto bytes = UNSAFE_BUFFERS(
+            base::span(view.data, static_cast<size_t>(view.size)));
+        copy.bytes.assign(bytes.begin(), bytes.end());
       }
       break;
     }
@@ -292,11 +297,8 @@ bool ReadTaggedValue(v8::Isolate* isolate,
       *error = "XLang binary value must contain a Buffer 'value'";
       return false;
     }
-    const auto* data =
-        reinterpret_cast<const uint8_t*>(node::Buffer::Data(value));
-    const size_t size = node::Buffer::Length(value);
-    if (size > 0)
-      output->binary_value.assign(data, data + size);
+    const auto bytes = electron::Buffer::as_byte_span(value);
+    output->binary_value.assign(bytes.begin(), bytes.end());
     output->native.type = XLANG_BRIDGE_VALUE_BINARY;
   } else if (type == "handle") {
     if (!dictionary.Get("value", &value) ||
@@ -547,7 +549,8 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
       result.Set("path", library_path_);
       result.Set("abiVersion", api_.abi_version);
       result.Set("featureFlags",
-                 v8::BigInt::NewFromUnsigned(isolate, api_.feature_flags));
+                 v8::BigInt::NewFromUnsigned(isolate, api_.feature_flags)
+                     .As<v8::Value>());
     }
     return result;
   }
@@ -599,7 +602,7 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
     if (!shutdown_required_ && !initializing_ && !initialized_) {
       gin_helper::Promise<v8::Local<v8::Value>> promise(isolate);
       auto result = promise.GetHandle();
-      promise.Resolve(v8::Undefined(isolate));
+      promise.Resolve();
       return result;
     }
     shutting_down_ = true;
@@ -737,7 +740,7 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
     }
     const xlang_bridge_status status = api_.release_handle(handle);
     if (status == XLANG_BRIDGE_STATUS_OK) {
-      promise.Resolve(v8::Undefined(isolate));
+      promise.Resolve();
     } else {
       promise.RejectWithErrorMessage(StatusMessage(status));
     }
@@ -893,15 +896,27 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
 
     std::vector<OwnedBridgeValue> args_copy;
     args_copy.reserve(arg_count);
-    for (uint32_t i = 0; args && i < arg_count; ++i)
-      args_copy.push_back(CopyBridgeValue(&args[i]));
+    if (args) {
+      // SAFETY: The bridge owns this array for the duration of the callback
+      // and provides the number of initialized elements.
+      const auto args_span = UNSAFE_BUFFERS(
+          base::span(args, static_cast<size_t>(arg_count)));
+      for (const auto& arg : args_span)
+        args_copy.push_back(CopyBridgeValue(&arg));
+    }
 
     std::vector<OwnedNamedValue> kwargs_copy;
     kwargs_copy.reserve(kwarg_count);
-    for (uint32_t i = 0; kwargs && i < kwarg_count; ++i) {
-      kwargs_copy.push_back(
-          {.name = CopyString(kwargs[i].name).value_or(std::string()),
-           .value = CopyBridgeValue(&kwargs[i].value)});
+    if (kwargs) {
+      // SAFETY: The bridge owns this array for the duration of the callback
+      // and provides the number of initialized elements.
+      const auto kwargs_span = UNSAFE_BUFFERS(
+          base::span(kwargs, static_cast<size_t>(kwarg_count)));
+      for (const auto& kwarg : kwargs_span) {
+        kwargs_copy.push_back(
+            {.name = CopyString(kwarg.name).value_or(std::string()),
+             .value = CopyBridgeValue(&kwarg.value)});
+      }
     }
 
     state->task_runner->PostTask(
@@ -1006,7 +1021,8 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
 
     if (request.kind == PendingKind::kEventOn) {
       request.promise.Resolve(
-          v8::BigInt::NewFromUnsigned(isolate, request.subscription_id));
+          v8::BigInt::NewFromUnsigned(isolate, request.subscription_id)
+              .As<v8::Value>());
       // Promise reactions run at the microtask checkpoint at the end of this
       // task. Delivering buffered events in a following task guarantees that
       // the JS facade has recorded the resolved subscription id first.
@@ -1016,7 +1032,7 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
     } else if (request.kind == PendingKind::kInitialize ||
                request.kind == PendingKind::kEventOff ||
                request.kind == PendingKind::kShutdown) {
-      request.promise.Resolve(v8::Undefined(isolate));
+      request.promise.Resolve();
     } else {
       request.promise.Resolve(ToV8(isolate, value));
     }
@@ -1119,7 +1135,8 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
         break;
       case XLANG_BRIDGE_VALUE_INT64:
         result.Set("type", "int64");
-        result.Set("value", v8::BigInt::New(isolate, value.int64_value));
+        result.Set("value", v8::BigInt::New(isolate, value.int64_value)
+                                .As<v8::Value>());
         break;
       case XLANG_BRIDGE_VALUE_DOUBLE:
         result.Set("type", "double");
@@ -1133,24 +1150,28 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
                                                 ? ""
                                                 : reinterpret_cast<const char*>(
                                                       value.bytes.data()),
-                                            value.bytes.size())));
+                                            value.bytes.size()))
+                       .As<v8::Value>());
         break;
       case XLANG_BRIDGE_VALUE_BINARY:
         result.Set("type", "binary");
         result.Set("value",
                    electron::Buffer::Copy(isolate, base::span(value.bytes))
-                       .ToLocalChecked());
+                       .ToLocalChecked()
+                       .As<v8::Value>());
         break;
       case XLANG_BRIDGE_VALUE_HANDLE:
         result.Set("type", "handle");
         result.Set("value",
-                   v8::BigInt::NewFromUnsigned(isolate, value.handle_value));
+                   v8::BigInt::NewFromUnsigned(isolate, value.handle_value)
+                       .As<v8::Value>());
         result.Set("objectType", value.flags);
         break;
       case XLANG_BRIDGE_VALUE_SUBSCRIPTION:
         result.Set("type", "subscription");
         result.Set("value",
-                   v8::BigInt::NewFromUnsigned(isolate, value.handle_value));
+                   v8::BigInt::NewFromUnsigned(isolate, value.handle_value)
+                       .As<v8::Value>());
         break;
       case XLANG_BRIDGE_VALUE_UNDEFINED:
       default:
