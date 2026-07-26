@@ -26,6 +26,7 @@ struct Result {
   xlang_bridge_status status = XLANG_BRIDGE_STATUS_INTERNAL_ERROR;
   xlang_bridge_value value{};
   bool has_value = false;
+  std::string bytes;
   std::string error;
 };
 
@@ -98,6 +99,14 @@ class Results {
     if (value != nullptr) {
       result.value = *value;
       result.has_value = true;
+      if ((value->type == XLANG_BRIDGE_VALUE_STRING ||
+           value->type == XLANG_BRIDGE_VALUE_BINARY) &&
+          value->data.bytes_value.data != nullptr &&
+          value->data.bytes_value.size != 0) {
+        result.bytes.assign(
+            reinterpret_cast<const char*>(value->data.bytes_value.data),
+            static_cast<size_t>(value->data.bytes_value.size));
+      }
     }
     if (error.data != nullptr && error.size != 0) {
       result.error.assign(reinterpret_cast<const char*>(error.data),
@@ -443,10 +452,103 @@ bool RunEventScenario(const char* label,
     return false;
   }
 
+  const std::string echo = "echo";
+  const std::string binary_payload{"\0\x01\x7f\x80\xff\0", 6};
+  xlang_bridge_value binary_argument{};
+  binary_argument.struct_size = sizeof(binary_argument);
+  binary_argument.type = XLANG_BRIDGE_VALUE_BINARY;
+  binary_argument.data.bytes_value = View(binary_payload);
+  if (api.call_member(first_request_id + 5,
+                      event_module.value.data.handle_value, View(echo),
+                      &binary_argument, 1, nullptr,
+                      0) != XLANG_BRIDGE_STATUS_OK) {
+    std::cerr << label << " binary echo was not accepted\n";
+    return false;
+  }
+  Result echoed = results.Wait(first_request_id + 5);
+  const std::string echo_operation = std::string(label) + " binary echo";
+  if (!Check(echo_operation.c_str(), echoed) || !echoed.has_value ||
+      echoed.value.type != XLANG_BRIDGE_VALUE_BINARY ||
+      echoed.bytes != binary_payload) {
+    std::cerr << label << " binary echo did not preserve the payload\n";
+    return false;
+  }
+
   if (!module_handle.Release()) {
     std::cerr << label << " release_handle was not accepted\n";
     return false;
   }
+  return true;
+}
+
+bool ArmShutdownRaceScenario(const xlang_bridge_api& api,
+                             Results& results,
+                             xlang_bridge_request_id first_request_id,
+                             xlang_bridge_subscription_id subscription_id) {
+  const std::string module_name = "bridge_event_test";
+  const std::string module_path = "xlang_bridge_event_test";
+  if (api.import_module(first_request_id, View(module_name), View(module_path),
+                        {}) != XLANG_BRIDGE_STATUS_OK) {
+    std::cerr << "shutdown race module import was not accepted\n";
+    return false;
+  }
+  Result imported = results.Wait(first_request_id);
+  if (!Check("shutdown race module import", imported) || !imported.has_value ||
+      imported.value.type != XLANG_BRIDGE_VALUE_HANDLE) {
+    return false;
+  }
+  ScopedBridgeHandle module_handle(api, imported.value.data.handle_value);
+
+  const std::string changed_event = "changed";
+  if (api.event_on(first_request_id + 1, imported.value.data.handle_value,
+                   View(changed_event),
+                   subscription_id) != XLANG_BRIDGE_STATUS_OK) {
+    std::cerr << "shutdown race event_on was not accepted\n";
+    return false;
+  }
+  Result subscribed = results.Wait(first_request_id + 1);
+  if (!Check("shutdown race event_on", subscribed) || !subscribed.has_value ||
+      subscribed.value.type != XLANG_BRIDGE_VALUE_SUBSCRIPTION ||
+      subscribed.value.data.subscription_value != subscription_id) {
+    return false;
+  }
+
+  const std::string emit_blocked = "emit_blocked";
+  if (api.call_member(first_request_id + 2, imported.value.data.handle_value,
+                      View(emit_blocked), nullptr, 0, nullptr,
+                      0) != XLANG_BRIDGE_STATUS_OK) {
+    std::cerr << "shutdown race emitter was not accepted\n";
+    return false;
+  }
+  Result emitted = results.Wait(first_request_id + 2);
+  if (!Check("shutdown race emitter", emitted) || !emitted.has_value ||
+      emitted.value.type != XLANG_BRIDGE_VALUE_BOOL ||
+      emitted.value.data.boolean_value == 0) {
+    return false;
+  }
+
+  const std::string wait_until_blocked = "wait_until_blocked";
+  xlang_bridge_value timeout{};
+  timeout.struct_size = sizeof(timeout);
+  timeout.type = XLANG_BRIDGE_VALUE_INT64;
+  timeout.data.int64_value = 2000;
+  if (api.call_member(first_request_id + 3, imported.value.data.handle_value,
+                      View(wait_until_blocked), &timeout, 1, nullptr,
+                      0) != XLANG_BRIDGE_STATUS_OK) {
+    std::cerr << "shutdown race barrier was not accepted\n";
+    return false;
+  }
+  Result blocked = results.Wait(first_request_id + 3);
+  if (!Check("shutdown race barrier", blocked) || !blocked.has_value ||
+      blocked.value.type != XLANG_BRIDGE_VALUE_BOOL ||
+      blocked.value.data.boolean_value == 0) {
+    std::cerr << "shutdown race event did not reach the native blocker\n";
+    return false;
+  }
+
+  // The event thread has snapshotted the bridge callback but has not entered
+  // it yet. Leave the subscription active so shutdown must drain that pending
+  // callback before unloading the XLang engine.
   return true;
 }
 
@@ -707,6 +809,10 @@ int main(int argc, char** argv) {
       changed_answer.value.type != XLANG_BRIDGE_VALUE_INT64 ||
       changed_answer.value.data.int64_value != 43) {
     std::cerr << "expected changed answer to equal 43\n";
+    return 1;
+  }
+
+  if (!ArmShutdownRaceScenario(api, results, 60, 7002)) {
     return 1;
   }
 

@@ -81,6 +81,7 @@ auto_filenames = {
     "docs/api/web-utils.md",
     "docs/api/webview-tag.md",
     "docs/api/window-open.md",
+    "docs/api/xlang.md",
     "docs/api/structures/activation-arguments.md",
     "docs/api/structures/base-window-options.md",
     "docs/api/structures/bluetooth-device.md",
@@ -187,6 +188,10 @@ auto_filenames = {
     "docs/api/structures/window-open-handler-response.md",
     "docs/api/structures/window-session-end-event.md",
     "docs/api/structures/window-state-persistence.md",
+    "docs/api/structures/xlang-call-options.md",
+    "docs/api/structures/xlang-event.md",
+    "docs/api/structures/xlang-import-options.md",
+    "docs/api/structures/xlang-initialize-options.md",
   ]
 
   node_header_sources = [
@@ -644,6 +649,8 @@ auto_filenames = {
     "lib/browser/api/web-contents-view.ts",
     "lib/browser/api/web-contents.ts",
     "lib/browser/api/web-frame-main.ts",
+    "lib/browser/api/xlang-remote.ts",
+    "lib/browser/api/xlang.ts",
     "lib/browser/default-menu.ts",
     "lib/browser/desktop-name.ts",
     "lib/browser/guest-view-manager.ts",

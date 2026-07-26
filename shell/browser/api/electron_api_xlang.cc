@@ -1079,7 +1079,8 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
                     v8::Local<v8::Function> callback,
                     std::vector<OwnedBridgeValue> args,
                     std::vector<OwnedNamedValue> kwargs) {
-    v8::Local<v8::Context> context = callback->GetCreationContextChecked();
+    v8::Local<v8::Context> context =
+        callback->GetCreationContextChecked(isolate);
     v8::Context::Scope context_scope(context);
 
     v8::Local<v8::Array> js_args =
@@ -1137,12 +1138,7 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
       case XLANG_BRIDGE_VALUE_BINARY:
         result.Set("type", "binary");
         result.Set("value",
-                   electron::Buffer::Copy(
-                       isolate,
-                       value.bytes.empty()
-                           ? ""
-                           : reinterpret_cast<const char*>(value.bytes.data()),
-                       value.bytes.size())
+                   electron::Buffer::Copy(isolate, base::span(value.bytes))
                        .ToLocalChecked());
         break;
       case XLANG_BRIDGE_VALUE_HANDLE:

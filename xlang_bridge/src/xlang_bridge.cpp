@@ -614,11 +614,14 @@ class Bridge {
             return;
           }
 
-          X::U_FUNC handler([this, subscription_id](X::XRuntime*, X::XObj*,
-                                                    X::XObj*, X::ARGS& params,
-                                                    X::KWARGS& kwargs,
-                                                    X::Value& ret_value) {
-            if (BeginEventCallback()) {
+          auto callback_lifetime =
+              std::make_shared<EventCallbackLifetime>(*this);
+          X::U_FUNC handler([this, subscription_id, callback_lifetime](
+                                X::XRuntime*, X::XObj*, X::XObj*,
+                                X::ARGS& params, X::KWARGS& kwargs,
+                                X::Value& ret_value) {
+            ScopedEventCallback event_callback(*this);
+            if (event_callback.accepting()) {
               try {
                 EmitEvent(subscription_id, params, kwargs);
               } catch (const std::exception& error) {
@@ -627,7 +630,6 @@ class Bridge {
               } catch (...) {
                 Log(3, "XLang event callback failed");
               }
-              EndEventCallback();
             }
             ret_value = X::Value(true);
             return true;
@@ -639,6 +641,7 @@ class Bridge {
           provisional.event = event_value;
           provisional.callback = callback_value;
           provisional.cookie = 0;
+          provisional.callback_lifetime = callback_lifetime;
           {
             std::lock_guard<std::mutex> lock(subscription_mutex_);
             const auto inserted =
@@ -733,15 +736,46 @@ class Bridge {
     kStopped
   };
 
+  struct QueuedTask {
+    xlang_bridge_request_id request_id = 0;
+    std::function<void()> function;
+  };
+
+  class ScopedEventCallback {
+   public:
+    explicit ScopedEventCallback(Bridge& bridge)
+        : bridge_(bridge), accepting_(bridge_.BeginEventCallback()) {}
+
+    ScopedEventCallback(const ScopedEventCallback&) = delete;
+    ScopedEventCallback& operator=(const ScopedEventCallback&) = delete;
+
+    ~ScopedEventCallback() { bridge_.EndEventCallback(); }
+
+    bool accepting() const { return accepting_; }
+
+   private:
+    Bridge& bridge_;
+    bool accepting_;
+  };
+
+  class EventCallbackLifetime {
+   public:
+    explicit EventCallbackLifetime(Bridge& bridge) : bridge_(bridge) {}
+
+    EventCallbackLifetime(const EventCallbackLifetime&) = delete;
+    EventCallbackLifetime& operator=(const EventCallbackLifetime&) = delete;
+
+    ~EventCallbackLifetime() { bridge_.NotifyEventCallbackLifetimeReleased(); }
+
+   private:
+    Bridge& bridge_;
+  };
+
   struct Subscription {
     X::Value event;
     X::Value callback;
     int64_t cookie = 0;
-  };
-
-  struct QueuedTask {
-    xlang_bridge_request_id request_id = 0;
-    std::function<void()> function;
+    std::weak_ptr<EventCallbackLifetime> callback_lifetime;
   };
 
   Bridge() = default;
@@ -925,30 +959,39 @@ class Bridge {
     accepting_event_callbacks_.store(false, std::memory_order_release);
     Log(1, "Stopping XLang event subscriptions");
     std::vector<xlang_bridge_subscription_id> subscription_ids;
+    std::vector<std::weak_ptr<EventCallbackLifetime>> callback_lifetimes;
     {
       std::lock_guard<std::mutex> lock(subscription_mutex_);
       subscription_ids.reserve(subscriptions_.size());
+      callback_lifetimes.reserve(subscriptions_.size());
       for (const auto& entry : subscriptions_) {
         subscription_ids.push_back(entry.first);
+        callback_lifetimes.push_back(entry.second.callback_lifetime);
       }
     }
     for (const auto id : subscription_ids) {
       UnsubscribeOnWorker(id);
     }
+    {
+      // Drop the bridge's callback references before waiting. XLang event
+      // snapshots retain their own reference until all pending invocations
+      // finish, which keeps the corresponding lifetime token alive.
+      std::lock_guard<std::mutex> lock(subscription_mutex_);
+      subscriptions_.clear();
+    }
 
-    Log(1, "Waiting for in-flight XLang event callbacks");
+    Log(1, "Waiting for pending XLang event callbacks");
     {
       std::unique_lock<std::mutex> lock(event_barrier_mutex_);
-      event_barrier_cv_.wait(lock, [this]() {
-        return active_event_callbacks_.load(std::memory_order_acquire) == 0;
+      event_barrier_cv_.wait(lock, [this, &callback_lifetimes]() {
+        return active_event_callbacks_.load(std::memory_order_acquire) == 0 &&
+               std::all_of(
+                   callback_lifetimes.begin(), callback_lifetimes.end(),
+                   [](const auto& lifetime) { return lifetime.expired(); });
       });
     }
 
     Log(1, "Releasing XLang bridge handles");
-    {
-      std::lock_guard<std::mutex> lock(subscription_mutex_);
-      subscriptions_.clear();
-    }
     {
       std::lock_guard<std::mutex> lock(handle_mutex_);
       handles_.clear();
@@ -984,11 +1027,7 @@ class Bridge {
 
   bool BeginEventCallback() {
     active_event_callbacks_.fetch_add(1, std::memory_order_acq_rel);
-    if (!accepting_event_callbacks_.load(std::memory_order_acquire)) {
-      EndEventCallback();
-      return false;
-    }
-    return true;
+    return accepting_event_callbacks_.load(std::memory_order_acquire);
   }
 
   void EndEventCallback() {
@@ -996,6 +1035,11 @@ class Bridge {
       std::lock_guard<std::mutex> lock(event_barrier_mutex_);
       event_barrier_cv_.notify_all();
     }
+  }
+
+  void NotifyEventCallbackLifetimeReleased() {
+    std::lock_guard<std::mutex> lock(event_barrier_mutex_);
+    event_barrier_cv_.notify_all();
   }
 
   X::Value QueryMember(X::Value& object, const std::string& member) {
@@ -1147,12 +1191,19 @@ class Bridge {
         return true;
       }
       case XLANG_BRIDGE_VALUE_BINARY: {
-        char* bytes = nullptr;
-        if (!input.bytes.empty()) {
-          bytes = new char[input.bytes.size()];
-          std::memcpy(bytes, input.bytes.data(), input.bytes.size());
+        X::Bin binary(static_cast<unsigned long long>(input.bytes.size()),
+                      true);
+        X::XBin* binary_object = binary;
+        if (binary_object == nullptr) {
+          return false;
         }
-        X::Bin binary(bytes, input.bytes.size(), true);
+        if (!input.bytes.empty()) {
+          char* destination = binary_object->Data();
+          if (destination == nullptr) {
+            return false;
+          }
+          std::memcpy(destination, input.bytes.data(), input.bytes.size());
+        }
         output = X::Value(binary);
         return true;
       }
