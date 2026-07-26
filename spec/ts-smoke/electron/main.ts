@@ -22,7 +22,8 @@ import {
   systemPreferences,
   webContents,
   TouchBar,
-  utilityProcess
+  utilityProcess,
+  xlang
 } from 'electron/main';
 
 import * as path from 'node:path';
@@ -1368,3 +1369,22 @@ const touchBar = new TouchBar({
 });
 
 win4.setTouchBar(touchBar);
+
+async function checkXLangTypes() {
+  await xlang.initialize({ libraryPath: '/path/to/xlang' });
+  const module = await xlang.importModule('yaml', {
+    fromPath: 'xlang_yaml',
+    thru: 'lrpc:9089'
+  });
+  const listener = (event: Electron.XLangEvent) => console.log(event.args, event.kwargs);
+  await module.set('enabled', true);
+  await module.get('enabled');
+  await module.invoke(['input'], { kwargs: { quality: 'high' } });
+  await module.call('render', ['input'], { kwargs: { quality: 'high' } });
+  await module.on('ready', listener);
+  await module.off('ready', listener);
+  await module.dispose();
+  await xlang.shutdown();
+}
+
+void checkXLangTypes;

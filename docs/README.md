@@ -141,6 +141,7 @@ These individual tutorials expand on topics discussed in the guide above.
 * [webContents](api/web-contents.md)
 * [webFrameMain](api/web-frame-main.md)
 * [WebContentsView](api/web-contents-view.md)
+* [xlang](api/xlang.md)
 
 ### Modules for the Renderer Process (Web Page):
 

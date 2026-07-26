@@ -240,6 +240,7 @@ filenames = {
   ]
 
   lib_sources = [
+    "xlang_bridge/include/xlang_bridge.h",
     "shell/app/command_line_args.cc",
     "shell/app/command_line_args.h",
     "shell/app/electron_content_client.cc",
@@ -330,6 +331,8 @@ filenames = {
     "shell/browser/api/electron_api_web_socket.cc",
     "shell/browser/api/electron_api_web_socket.h",
     "shell/browser/api/electron_api_web_view_manager.cc",
+    "shell/browser/api/electron_api_xlang.cc",
+    "shell/browser/api/electron_api_xlang.h",
     "shell/browser/api/frame_subscriber.cc",
     "shell/browser/api/frame_subscriber.h",
     "shell/browser/api/gpu_info_enumerator.cc",

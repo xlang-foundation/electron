@@ -29,6 +29,66 @@ declare namespace NodeJS {
     isComponentBuild(): boolean;
   }
 
+  type XLangTaggedValue =
+    | { type: 'undefined' }
+    | { type: 'null' }
+    | { type: 'boolean'; value: boolean }
+    | { type: 'int64'; value: bigint }
+    | { type: 'double'; value: number }
+    | { type: 'string'; value: string }
+    | { type: 'binary'; value: Buffer }
+    | { type: 'handle'; value: bigint; objectType: number };
+
+  interface XLangNativeBinding {
+    load(libraryPath?: string): unknown;
+    isLoaded(): boolean;
+    getBridgeInfo(): {
+      loaded: boolean;
+      path?: string;
+      abiVersion?: number;
+      featureFlags?: bigint;
+    };
+    initialize(options: Record<string, unknown>): Promise<void>;
+    shutdown(): Promise<void>;
+    importModule(
+      name: string,
+      options: { fromPath?: string; thru?: string }
+    ): Promise<XLangTaggedValue>;
+    get(handle: bigint, name: string): Promise<XLangTaggedValue>;
+    set(
+      handle: bigint,
+      name: string,
+      value: XLangTaggedValue
+    ): Promise<XLangTaggedValue | void>;
+    invoke(
+      handle: bigint,
+      args: XLangTaggedValue[],
+      kwargs: Record<string, XLangTaggedValue>
+    ): Promise<XLangTaggedValue>;
+    call(
+      handle: bigint,
+      name: string,
+      args: XLangTaggedValue[],
+      kwargs: Record<string, XLangTaggedValue>
+    ): Promise<XLangTaggedValue>;
+    callMember(
+      handle: bigint,
+      name: string,
+      args: XLangTaggedValue[],
+      kwargs: Record<string, XLangTaggedValue>
+    ): Promise<XLangTaggedValue>;
+    release(handle: bigint): Promise<void>;
+    on(
+      handle: bigint,
+      eventName: string,
+      callback: (
+        args: XLangTaggedValue[],
+        kwargs: Record<string, XLangTaggedValue>
+      ) => void
+    ): Promise<bigint>;
+    off(token: bigint): Promise<void>;
+  }
+
   interface IpcRendererImpl {
     send(internal: boolean, channel: string, args: any[]): void;
     sendSync(internal: boolean, channel: string, args: any[]): any;
@@ -320,6 +380,7 @@ declare namespace NodeJS {
     _linkedBinding(name: 'electron_browser_web_contents_view'): { WebContentsView: typeof Electron.WebContentsView };
     _linkedBinding(name: 'electron_browser_web_view_manager'): WebViewManagerBinding;
     _linkedBinding(name: 'electron_browser_web_frame_main'): WebFrameMainBinding;
+    _linkedBinding(name: 'electron_browser_xlang'): { xlang: XLangNativeBinding };
     _linkedBinding(name: 'electron_renderer_crash_reporter'): Electron.CrashReporter;
     _linkedBinding(name: 'electron_renderer_ipc'): IpcRendererBinding;
     _linkedBinding(name: 'electron_renderer_web_frame'): WebFrameBinding;
