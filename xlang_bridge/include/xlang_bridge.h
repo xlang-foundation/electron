@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-#define XLANG_BRIDGE_ABI_VERSION 1u
+#define XLANG_BRIDGE_ABI_VERSION 2u
 
 typedef uint64_t xlang_bridge_request_id;
 typedef uint64_t xlang_bridge_handle;
@@ -137,6 +137,12 @@ typedef void (*xlang_bridge_log_callback)(void* user_data,
                                           int32_t level,
                                           xlang_bridge_bytes_view message);
 
+typedef void (*xlang_bridge_direct_result_callback)(
+    void* user_data,
+    xlang_bridge_status status,
+    const xlang_bridge_value* value,
+    xlang_bridge_bytes_view error_message);
+
 typedef struct xlang_bridge_host_callbacks {
   uint32_t struct_size;
   uint32_t abi_version;
@@ -196,6 +202,22 @@ typedef struct xlang_bridge_api {
                                      uint32_t arg_count,
                                      const xlang_bridge_named_value* kwargs,
                                      uint32_t kwarg_count);
+
+  /*
+   * Invoke an in-process XLang member on the calling thread. The completion
+   * callback runs before this function returns. This is the thin JS <->
+   * X::Value path used by Electron callSync; it does not enter the asynchronous
+   * bridge worker queue.
+   */
+  xlang_bridge_status (*call_member_direct)(
+      xlang_bridge_handle object,
+      xlang_bridge_bytes_view member_name,
+      const xlang_bridge_value* args,
+      uint32_t arg_count,
+      const xlang_bridge_named_value* kwargs,
+      uint32_t kwarg_count,
+      xlang_bridge_direct_result_callback result_callback,
+      void* result_user_data);
 
   xlang_bridge_status (*event_on)(xlang_bridge_request_id request_id,
                                   xlang_bridge_handle object,

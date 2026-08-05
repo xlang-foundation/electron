@@ -1,11 +1,6 @@
 import { expect } from 'chai';
 
-import {
-  createXLangFacade,
-  XLangEvent,
-  XLangNativeBinding,
-  XLangTaggedValue
-} from '../lib/browser/api/xlang-remote';
+import { createXLangFacade, XLangEvent, XLangNativeBinding, XLangTaggedValue } from '../lib/browser/api/xlang-remote';
 
 type NativeEventCallback = Parameters<XLangNativeBinding['on']>[2];
 
@@ -90,6 +85,11 @@ const makeNativeBinding = () => {
       return { type: 'string', value: name };
     },
 
+    callMemberSync(handle, name, args, kwargs) {
+      calls.call.push({ handle, name, args, kwargs });
+      return { type: 'string', value: name };
+    },
+
     async release(handle) {
       calls.release.push(handle);
     },
@@ -159,9 +159,7 @@ describe('XLang JavaScript facade', () => {
     };
     const xlang = createXLangFacade(native);
 
-    await expect(xlang.importModule('first')).to.be.rejectedWith(
-      'temporary initialization failure'
-    );
+    await expect(xlang.importModule('first')).to.be.rejectedWith('temporary initialization failure');
     await xlang.importModule('second');
 
     expect(calls.initialize).to.deep.equal([{}, {}]);
@@ -200,6 +198,7 @@ describe('XLang JavaScript facade', () => {
         kwargs: { fallback: false }
       })
     ).to.equal('get');
+    expect(module.callSync('statement', ['select 1'])).to.equal('statement');
     expect(await module.invoke(['direct'], { kwargs: { mode: 'fast' } })).to.equal('invoke');
 
     expect(calls.set).to.deep.equal([
@@ -222,6 +221,12 @@ describe('XLang JavaScript facade', () => {
     });
     expect(calls.call[1].kwargs).to.deep.equal({
       fallback: { type: 'boolean', value: false }
+    });
+    expect(calls.call[2]).to.deep.equal({
+      handle: 1n,
+      name: 'statement',
+      args: [{ type: 'string', value: 'select 1' }],
+      kwargs: {}
     });
     expect(calls.invoke).to.deep.equal([
       {
@@ -289,14 +294,9 @@ describe('XLang JavaScript facade', () => {
     const module = await xlang.importModule('cantor');
 
     const registering = module.on('ready', () => {});
-    const registrationRejection = expect(registering).to.be.rejectedWith(
-      'This XLang object has been disposed'
-    );
+    const registrationRejection = expect(registering).to.be.rejectedWith('This XLang object has been disposed');
     const disposing = module.dispose();
-    pending.callback?.(
-      [{ type: 'handle', value: 22n, objectType: 5 }],
-      {}
-    );
+    pending.callback?.([{ type: 'handle', value: 22n, objectType: 5 }], {});
     registration.resolve(99n);
 
     await registrationRejection;
@@ -435,9 +435,7 @@ describe('XLang JavaScript facade', () => {
     const stopping = xlang.shutdown();
     await Promise.resolve();
     const importing = xlang.importModule('second');
-    const importRejection = expect(importing).to.be.rejectedWith(
-      'XLang bridge: unsupported'
-    );
+    const importRejection = expect(importing).to.be.rejectedWith('XLang bridge: unsupported');
     await Promise.resolve();
 
     expect(calls.imports.map(({ name }) => name)).to.deep.equal(['first']);

@@ -8,10 +8,7 @@ export type XLangTaggedValue =
   | { type: 'binary'; value: Buffer }
   | { type: 'handle'; value: bigint; objectType: number };
 
-type XLangNativeEventCallback = (
-  args: XLangTaggedValue[],
-  kwargs: Record<string, XLangTaggedValue>
-) => void;
+type XLangNativeEventCallback = (args: XLangTaggedValue[], kwargs: Record<string, XLangTaggedValue>) => void;
 
 export interface XLangNativeBinding {
   load(libraryPath?: string): unknown;
@@ -21,17 +18,19 @@ export interface XLangNativeBinding {
   importModule(name: string, options: XLangImportOptions): Promise<XLangTaggedValue>;
   get(handle: bigint, name: string): Promise<XLangTaggedValue>;
   set(handle: bigint, name: string, value: XLangTaggedValue): Promise<XLangTaggedValue | void>;
-  invoke(
-    handle: bigint,
-    args: XLangTaggedValue[],
-    kwargs: Record<string, XLangTaggedValue>
-  ): Promise<XLangTaggedValue>;
+  invoke(handle: bigint, args: XLangTaggedValue[], kwargs: Record<string, XLangTaggedValue>): Promise<XLangTaggedValue>;
   call(
     handle: bigint,
     name: string,
     args: XLangTaggedValue[],
     kwargs: Record<string, XLangTaggedValue>
   ): Promise<XLangTaggedValue>;
+  callMemberSync(
+    handle: bigint,
+    name: string,
+    args: XLangTaggedValue[],
+    kwargs: Record<string, XLangTaggedValue>
+  ): XLangTaggedValue;
   release(handle: bigint): Promise<void>;
   on(handle: bigint, eventName: string, callback: XLangNativeEventCallback): Promise<bigint>;
   off(token: bigint): Promise<void>;
@@ -66,6 +65,7 @@ export interface XLangObjectMethods {
   set(name: string, value: unknown): Promise<void>;
   invoke(args?: unknown[], options?: XLangCallOptions): Promise<unknown>;
   call(name: string, args?: unknown[], options?: XLangCallOptions): Promise<unknown>;
+  callSync(name: string, args?: unknown[], options?: XLangCallOptions): unknown;
   on(eventName: string, listener: XLangListener): Promise<void>;
   off(eventName: string, listener?: XLangListener): Promise<void>;
   dispose(): Promise<void>;
@@ -88,7 +88,7 @@ const int64Maximum = (1n << 63n) - 1n;
 const minimumSafeInteger = BigInt(Number.MIN_SAFE_INTEGER);
 const maximumSafeInteger = BigInt(Number.MAX_SAFE_INTEGER);
 const inspectSymbol = Symbol.for('nodejs.util.inspect.custom');
-const explicitProxyMethods = new Set(['get', 'set', 'invoke', 'call', 'on', 'off', 'dispose']);
+const explicitProxyMethods = new Set(['get', 'set', 'invoke', 'call', 'callSync', 'on', 'off', 'dispose']);
 
 const remoteCoreByObject = new WeakMap<object, XLangRemoteObjectCore>();
 
@@ -163,9 +163,7 @@ class XLangContext {
       }
     }
 
-    throw new TypeError(
-      'Unsupported XLang value; expected a scalar, Buffer, bigint, or XLang object'
-    );
+    throw new TypeError('Unsupported XLang value; expected a scalar, Buffer, bigint, or XLang object');
   }
 
   validate(value: XLangTaggedValue): void {
@@ -230,9 +228,7 @@ class XLangContext {
         handles.add(value.value);
       }
     }
-    void Promise.allSettled(
-      [...handles].map(async (handle) => this.native.release(handle))
-    );
+    void Promise.allSettled([...handles].map(async (handle) => this.native.release(handle)));
   }
 
   isObject(value: unknown): value is XLangObject {
@@ -283,10 +279,7 @@ interface XLangSubscriptionRecord {
 
 class XLangRemoteObjectCore implements XLangObjectMethods {
   private readonly methodCache = new Map<PropertyKey, unknown>();
-  private readonly subscriptions = new Map<
-    string,
-    Map<XLangListener, Set<XLangSubscriptionRecord>>
-  >();
+  private readonly subscriptions = new Map<string, Map<XLangListener, Set<XLangSubscriptionRecord>>>();
   private disposePromise?: Promise<void>;
   private disposed = false;
   private released = false;
@@ -347,22 +340,21 @@ class XLangRemoteObjectCore implements XLangObjectMethods {
   async invoke(args: unknown[] = [], options: XLangCallOptions = {}): Promise<unknown> {
     this.assertActive();
     const encoded = this.encodeCallInputs(args, options);
-    return this.context.decode(
-      await this.context.native.invoke(this.handle, encoded.args, encoded.kwargs)
-    );
+    return this.context.decode(await this.context.native.invoke(this.handle, encoded.args, encoded.kwargs));
   }
 
-  async call(
-    name: string,
-    args: unknown[] = [],
-    options: XLangCallOptions = {}
-  ): Promise<unknown> {
+  async call(name: string, args: unknown[] = [], options: XLangCallOptions = {}): Promise<unknown> {
     this.assertActive();
     validateName(name, 'name');
     const encoded = this.encodeCallInputs(args, options);
-    return this.context.decode(
-      await this.context.native.call(this.handle, name, encoded.args, encoded.kwargs)
-    );
+    return this.context.decode(await this.context.native.call(this.handle, name, encoded.args, encoded.kwargs));
+  }
+
+  callSync(name: string, args: unknown[] = [], options: XLangCallOptions = {}): unknown {
+    this.assertActive();
+    validateName(name, 'name');
+    const encoded = this.encodeCallInputs(args, options);
+    return this.context.decode(this.context.native.callMemberSync(this.handle, name, encoded.args, encoded.kwargs));
   }
 
   async on(eventName: string, listener: XLangListener): Promise<void> {
@@ -599,12 +591,8 @@ class XLangRemoteObjectCore implements XLangObjectMethods {
   }
 
   private async removeSubscriptions(records: XLangSubscriptionRecord[]): Promise<void> {
-    const results = await Promise.allSettled(
-      records.map(async (record) => this.ensureSubscriptionRemoved(record))
-    );
-    const failure = results.find(
-      (result): result is PromiseRejectedResult => result.status === 'rejected'
-    );
+    const results = await Promise.allSettled(records.map(async (record) => this.ensureSubscriptionRemoved(record)));
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (failure !== undefined) {
       throw failure.reason;
     }

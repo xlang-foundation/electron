@@ -173,6 +173,18 @@ xlang.importModule('renderer').then(async (renderer) => {
 })
 ```
 
+#### `object.callSync(name[, args][, options])`
+
+* `name` string - Method name.
+* `args` any[] (optional) - Positional arguments.
+* `options` [XLangCallOptions](structures/xlang-call-options.md) (optional)
+
+Returns `any` - The method result.
+
+Invokes XLang directly on the calling thread and returns after XLang finishes.
+It does not enter the asynchronous XLang worker queue. Use this only for APIs
+that require a synchronous contract, such as SQLite statement execution.
+
 #### `object.on(eventName, listener)`
 
 * `eventName` string - XLang event name.

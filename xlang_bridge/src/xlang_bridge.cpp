@@ -577,6 +577,71 @@ class Bridge {
     return XLANG_BRIDGE_STATUS_OK;
   }
 
+  xlang_bridge_status CallMemberDirect(
+      xlang_bridge_handle object,
+      xlang_bridge_bytes_view member_name,
+      const xlang_bridge_value* args,
+      uint32_t arg_count,
+      const xlang_bridge_named_value* kwargs,
+      uint32_t kwarg_count,
+      xlang_bridge_direct_result_callback result_callback,
+      void* result_user_data) {
+    const bool arguments_valid = object != 0 &&
+                                 IsRequiredViewValid(member_name) &&
+                                 result_callback != nullptr;
+    if (!IsOperationAccepted() || !arguments_valid) {
+      return OperationRejectionOrInvalid(arguments_valid);
+    }
+    std::vector<InputValue> copied_args;
+    std::vector<InputNamedValue> copied_kwargs;
+    if (!CopyInputs(args, arg_count, kwargs, kwarg_count, copied_args,
+                    copied_kwargs)) {
+      return XLANG_BRIDGE_STATUS_INVALID_ARGUMENT;
+    }
+    std::string member;
+    if (!CopyView(member_name, member)) {
+      return XLANG_BRIDGE_STATUS_INVALID_ARGUMENT;
+    }
+
+    X::Value owner;
+    if (!LookupHandle(object, owner)) {
+      const std::string error = "Unknown XLang object handle";
+      result_callback(result_user_data,
+                      XLANG_BRIDGE_STATUS_HANDLE_NOT_FOUND, nullptr,
+                      ViewOf(error));
+      return XLANG_BRIDGE_STATUS_OK;
+    }
+    X::Value function = QueryMember(owner, member);
+    if (!function.IsValid() || !function.IsObject()) {
+      const std::string error = "XLang member was not found or is not callable";
+      result_callback(result_user_data,
+                      XLANG_BRIDGE_STATUS_MEMBER_NOT_FOUND, nullptr,
+                      ViewOf(error));
+      return XLANG_BRIDGE_STATUS_OK;
+    }
+    X::ARGS call_args(static_cast<int>(copied_args.size()));
+    X::KWARGS call_kwargs(static_cast<int>(copied_kwargs.size()));
+    if (!BuildCallInputs(copied_args, copied_kwargs, call_args, call_kwargs)) {
+      const std::string error = "An argument referenced an unknown XLang handle";
+      result_callback(result_user_data,
+                      XLANG_BRIDGE_STATUS_HANDLE_NOT_FOUND, nullptr,
+                      ViewOf(error));
+      return XLANG_BRIDGE_STATUS_OK;
+    }
+    X::Value result;
+    if (!Invoke(function, call_args, call_kwargs, result)) {
+      const std::string error = TakeException("XLang call failed");
+      result_callback(result_user_data, XLANG_BRIDGE_STATUS_CALL_FAILED,
+                      nullptr, ViewOf(error));
+      return XLANG_BRIDGE_STATUS_OK;
+    }
+    ConvertedValue converted = ConvertOutput(result);
+    converted.RefreshView();
+    result_callback(result_user_data, XLANG_BRIDGE_STATUS_OK,
+                    &converted.value, {});
+    return XLANG_BRIDGE_STATUS_OK;
+  }
+
   xlang_bridge_status EventOn(xlang_bridge_request_id request_id,
                               xlang_bridge_handle object,
                               xlang_bridge_bytes_view event_name,
@@ -616,10 +681,10 @@ class Bridge {
 
           auto callback_lifetime =
               std::make_shared<EventCallbackLifetime>(*this);
-          X::U_FUNC handler([this, subscription_id, callback_lifetime](
-                                X::XRuntime*, X::XObj*, X::XObj*,
-                                X::ARGS& params, X::KWARGS& kwargs,
-                                X::Value& ret_value) {
+          X::EventHandler handler([this, subscription_id, callback_lifetime](
+                                      X::XRuntime*, X::XObj*,
+                                      X::ARGS& params, X::KWARGS& kwargs,
+                                      X::Value& ret_value) {
             ScopedEventCallback event_callback(*this);
             if (event_callback.accepting()) {
               try {
@@ -632,14 +697,17 @@ class Bridge {
               }
             }
             ret_value = X::Value(true);
-            return true;
           });
-          X::Func callback("__electron_xlang_event", handler);
-          X::Value callback_value(callback);
+
+          auto* event = dynamic_cast<X::XEvent*>(event_value.GetObj());
+          if (!event) {
+            Complete(request_id, XLANG_BRIDGE_STATUS_EVENT_FAILED, nullptr,
+                     "XLang member is not an event");
+            return;
+          }
 
           Subscription provisional;
           provisional.event = event_value;
-          provisional.callback = callback_value;
           provisional.cookie = 0;
           provisional.callback_lifetime = callback_lifetime;
           {
@@ -653,14 +721,8 @@ class Bridge {
             }
           }
 
-          X::ARGS event_args(1);
-          event_args.push_back(callback_value);
-          X::KWARGS event_kwargs(1);
-          X::Value operation{std::string(X::EventSubscribeOperation)};
-          event_kwargs.Add(X::EventOperationKeyword, operation);
-          X::Value cookie_value;
-          if (!Invoke(event_value, event_args, event_kwargs, cookie_value) ||
-              !cookie_value.IsNumber() || cookie_value.GetLongLong() == 0) {
+          const long cookie = event->AddHandler(std::move(handler));
+          if (cookie == 0) {
             {
               std::lock_guard<std::mutex> lock(subscription_mutex_);
               subscriptions_.erase(subscription_id);
@@ -674,7 +736,7 @@ class Bridge {
             std::lock_guard<std::mutex> lock(subscription_mutex_);
             const auto found = subscriptions_.find(subscription_id);
             if (found != subscriptions_.end()) {
-              found->second.cookie = cookie_value.GetLongLong();
+              found->second.cookie = cookie;
             }
           }
 
@@ -1295,15 +1357,11 @@ class Bridge {
       subscription = found->second;
     }
 
-    X::ARGS args(1);
-    X::Value cookie(static_cast<long long>(subscription.cookie));
-    args.push_back(cookie);
-    X::KWARGS kwargs(1);
-    X::Value operation{std::string(X::EventUnsubscribeOperation)};
-    kwargs.Add(X::EventOperationKeyword, operation);
-    X::Value result;
-    const bool ok =
-        Invoke(subscription.event, args, kwargs, result) && result.ToBool();
+    auto* event = dynamic_cast<X::XEvent*>(subscription.event.GetObj());
+    const bool ok = event != nullptr;
+    if (event) {
+      event->RemoveHandler(static_cast<long>(subscription.cookie));
+    }
     if (ok) {
       std::lock_guard<std::mutex> lock(subscription_mutex_);
       subscriptions_.erase(subscription_id);
@@ -1517,6 +1575,22 @@ xlang_bridge_status ApiCallMember(xlang_bridge_request_id request_id,
   });
 }
 
+xlang_bridge_status ApiCallMemberDirect(
+    xlang_bridge_handle object,
+    xlang_bridge_bytes_view member_name,
+    const xlang_bridge_value* args,
+    uint32_t arg_count,
+    const xlang_bridge_named_value* kwargs,
+    uint32_t kwarg_count,
+    xlang_bridge_direct_result_callback result_callback,
+    void* result_user_data) noexcept {
+  return GuardApiCall([&]() {
+    return Bridge::Get().CallMemberDirect(
+        object, member_name, args, arg_count, kwargs, kwarg_count,
+        result_callback, result_user_data);
+  });
+}
+
 xlang_bridge_status ApiEventOn(
     xlang_bridge_request_id request_id,
     xlang_bridge_handle object,
@@ -1572,6 +1646,7 @@ xlang_bridge_get_api(uint32_t requested_abi_version,
     api.set_member = &ApiSetMember;
     api.call = &ApiCall;
     api.call_member = &ApiCallMember;
+    api.call_member_direct = &ApiCallMemberDirect;
     api.event_on = &ApiEventOn;
     api.event_off = &ApiEventOff;
     api.release_handle = &ApiReleaseHandle;

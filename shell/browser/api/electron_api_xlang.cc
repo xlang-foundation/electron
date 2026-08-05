@@ -420,6 +420,13 @@ struct PendingRequest {
   xlang_bridge_subscription_id subscription_id;
 };
 
+struct DirectCallResult {
+  bool delivered = false;
+  xlang_bridge_status status = XLANG_BRIDGE_STATUS_INTERNAL_ERROR;
+  OwnedBridgeValue value;
+  std::string error_message;
+};
+
 struct QueuedEvent {
   std::vector<OwnedBridgeValue> args;
   std::vector<OwnedNamedValue> kwargs;
@@ -516,21 +523,20 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
     candidate_api.struct_size = sizeof(candidate_api);
     const xlang_bridge_status status =
         entry_point(XLANG_BRIDGE_ABI_VERSION, &host_callbacks_, &candidate_api);
-    constexpr size_t kRequiredApiSize =
-        offsetof(xlang_bridge_api, release_handle) +
-        sizeof(decltype(xlang_bridge_api::release_handle));
+    constexpr size_t kRequiredApiSize = sizeof(xlang_bridge_api);
     if (status != XLANG_BRIDGE_STATUS_OK ||
         candidate_api.abi_version != XLANG_BRIDGE_ABI_VERSION ||
         candidate_api.struct_size < kRequiredApiSize ||
         !candidate_api.initialize || !candidate_api.shutdown ||
         !candidate_api.import_module || !candidate_api.get_member ||
         !candidate_api.set_member || !candidate_api.call ||
-        !candidate_api.call_member || !candidate_api.event_on ||
+        !candidate_api.call_member || !candidate_api.call_member_direct ||
+        !candidate_api.event_on ||
         !candidate_api.event_off || !candidate_api.release_handle) {
       isolate->ThrowException(v8::Exception::Error(gin::StringToV8(
           isolate, status != XLANG_BRIDGE_STATUS_OK
                        ? StatusMessage(status)
-                       : "XLang bridge returned an incomplete ABI v1 table")));
+                       : "XLang bridge returned an incomplete ABI v2 table")));
       return false;
     }
 
@@ -725,6 +731,68 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
                   });
   }
 
+  v8::Local<v8::Value> CallMemberSync(v8::Isolate* isolate,
+                                      v8::Local<v8::Value> object_value,
+                                      const std::string& member_name,
+                                      v8::Local<v8::Value> args_value,
+                                      v8::Local<v8::Value> kwargs_value) {
+    xlang_bridge_handle object = 0;
+    if (!ReadBigInt(object_value, &object)) {
+      isolate->ThrowException(v8::Exception::TypeError(
+          gin::StringToV8(isolate, "XLang object handle must be a BigInt")));
+      return v8::Undefined(isolate);
+    }
+
+    std::vector<TaggedValueStorage> arg_storage;
+    std::vector<xlang_bridge_value> args;
+    std::vector<NamedValueStorage> kwarg_storage;
+    std::vector<xlang_bridge_named_value> kwargs;
+    std::string error;
+    if (!ReadTaggedArray(isolate, args_value, &arg_storage, &args, &error) ||
+        !ReadTaggedKwargs(isolate, kwargs_value, &kwarg_storage, &kwargs,
+                          &error)) {
+      isolate->ThrowException(
+          v8::Exception::TypeError(gin::StringToV8(isolate, error)));
+      return v8::Undefined(isolate);
+    }
+    if (!IsLoaded() || !initialized_ || shutting_down_) {
+      isolate->ThrowException(v8::Exception::Error(gin::StringToV8(
+          isolate, "The initialized XLang bridge is unavailable")));
+      return v8::Undefined(isolate);
+    }
+
+    electron::ScopedAllowBlockingForElectron allow_blocking;
+    DirectCallResult result;
+    const xlang_bridge_status submit_status = api_.call_member_direct(
+        object, BorrowedBytes(member_name), args.data(),
+        static_cast<uint32_t>(args.size()), kwargs.data(),
+        static_cast<uint32_t>(kwargs.size()),
+        [](void* user_data, xlang_bridge_status status,
+           const xlang_bridge_value* value,
+           xlang_bridge_bytes_view error_message) {
+          auto* result = static_cast<DirectCallResult*>(user_data);
+          result->delivered = true;
+          result->status = status;
+          result->value = CopyBridgeValue(value);
+          result->error_message =
+              CopyString(error_message).value_or("invalid bridge error message");
+        },
+        &result);
+    if (submit_status != XLANG_BRIDGE_STATUS_OK) {
+      result.status = submit_status;
+    } else if (!result.delivered) {
+      result.status = XLANG_BRIDGE_STATUS_INTERNAL_ERROR;
+      result.error_message = "XLang direct call returned without a result";
+    }
+    if (result.status != XLANG_BRIDGE_STATUS_OK) {
+      isolate->ThrowException(v8::Exception::Error(gin::StringToV8(
+          isolate, StatusMessage(result.status, result.error_message))));
+      ReleaseIfHandle(result.value);
+      return v8::Undefined(isolate);
+    }
+    return ToV8(isolate, result.value);
+  }
+
   v8::Local<v8::Promise> Release(v8::Isolate* isolate,
                                  v8::Local<v8::Value> handle_value) {
     gin_helper::Promise<v8::Local<v8::Value>> promise(isolate);
@@ -899,8 +967,8 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
     if (args) {
       // SAFETY: The bridge owns this array for the duration of the callback
       // and provides the number of initialized elements.
-      const auto args_span = UNSAFE_BUFFERS(
-          base::span(args, static_cast<size_t>(arg_count)));
+      const auto args_span =
+          UNSAFE_BUFFERS(base::span(args, static_cast<size_t>(arg_count)));
       for (const auto& arg : args_span)
         args_copy.push_back(CopyBridgeValue(&arg));
     }
@@ -910,8 +978,8 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
     if (kwargs) {
       // SAFETY: The bridge owns this array for the duration of the callback
       // and provides the number of initialized elements.
-      const auto kwargs_span = UNSAFE_BUFFERS(
-          base::span(kwargs, static_cast<size_t>(kwarg_count)));
+      const auto kwargs_span =
+          UNSAFE_BUFFERS(base::span(kwargs, static_cast<size_t>(kwarg_count)));
       for (const auto& kwarg : kwargs_span) {
         kwargs_copy.push_back(
             {.name = CopyString(kwarg.name).value_or(std::string()),
@@ -1135,8 +1203,8 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
         break;
       case XLANG_BRIDGE_VALUE_INT64:
         result.Set("type", "int64");
-        result.Set("value", v8::BigInt::New(isolate, value.int64_value)
-                                .As<v8::Value>());
+        result.Set("value",
+                   v8::BigInt::New(isolate, value.int64_value).As<v8::Value>());
         break;
       case XLANG_BRIDGE_VALUE_DOUBLE:
         result.Set("type", "double");
@@ -1284,6 +1352,9 @@ void InitializeXLang(v8::Local<v8::Object> exports) {
                                                 base::Unretained(xlang)));
   binding.SetMethod("callMember",
                     base::BindRepeating(&XLangBridgeBinding::CallMember,
+                                        base::Unretained(xlang)));
+  binding.SetMethod("callMemberSync",
+                    base::BindRepeating(&XLangBridgeBinding::CallMemberSync,
                                         base::Unretained(xlang)));
   binding.SetMethod("release", base::BindRepeating(&XLangBridgeBinding::Release,
                                                    base::Unretained(xlang)));

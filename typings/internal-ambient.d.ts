@@ -50,16 +50,9 @@ declare namespace NodeJS {
     };
     initialize(options: Record<string, unknown>): Promise<void>;
     shutdown(): Promise<void>;
-    importModule(
-      name: string,
-      options: { fromPath?: string; thru?: string }
-    ): Promise<XLangTaggedValue>;
+    importModule(name: string, options: { fromPath?: string; thru?: string }): Promise<XLangTaggedValue>;
     get(handle: bigint, name: string): Promise<XLangTaggedValue>;
-    set(
-      handle: bigint,
-      name: string,
-      value: XLangTaggedValue
-    ): Promise<XLangTaggedValue | void>;
+    set(handle: bigint, name: string, value: XLangTaggedValue): Promise<XLangTaggedValue | void>;
     invoke(
       handle: bigint,
       args: XLangTaggedValue[],
@@ -77,14 +70,17 @@ declare namespace NodeJS {
       args: XLangTaggedValue[],
       kwargs: Record<string, XLangTaggedValue>
     ): Promise<XLangTaggedValue>;
+    callMemberSync(
+      handle: bigint,
+      name: string,
+      args: XLangTaggedValue[],
+      kwargs: Record<string, XLangTaggedValue>
+    ): XLangTaggedValue;
     release(handle: bigint): Promise<void>;
     on(
       handle: bigint,
       eventName: string,
-      callback: (
-        args: XLangTaggedValue[],
-        kwargs: Record<string, XLangTaggedValue>
-      ) => void
+      callback: (args: XLangTaggedValue[], kwargs: Record<string, XLangTaggedValue>) => void
     ): Promise<bigint>;
     off(token: bigint): Promise<void>;
   }
