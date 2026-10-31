@@ -123,6 +123,9 @@ struct OwnedBridgeValue {
   double double_value = 0;
   uint64_t handle_value = 0;
   std::vector<uint8_t> bytes;
+  std::vector<OwnedBridgeValue> list_values;
+  std::vector<std::string> dict_names;
+  std::vector<OwnedBridgeValue> dict_values;
 };
 
 OwnedBridgeValue CopyBridgeValue(const xlang_bridge_value* value) {
@@ -167,6 +170,32 @@ OwnedBridgeValue CopyBridgeValue(const xlang_bridge_value* value) {
     case XLANG_BRIDGE_VALUE_UNDEFINED:
     case XLANG_BRIDGE_VALUE_NULL:
       break;
+    case XLANG_BRIDGE_VALUE_LIST: {
+      const auto view = value->data.list_value;
+      if (view.values || view.count == 0) {
+        copy.list_values.reserve(view.count);
+        const auto values = UNSAFE_BUFFERS(
+            base::span(view.values, static_cast<size_t>(view.count)));
+        for (const auto& item : values)
+          copy.list_values.push_back(CopyBridgeValue(&item));
+      }
+      break;
+    }
+    case XLANG_BRIDGE_VALUE_DICT: {
+      const auto view = value->data.dict_value;
+      if (view.values || view.count == 0) {
+        copy.dict_names.reserve(view.count);
+        copy.dict_values.reserve(view.count);
+        const auto values = UNSAFE_BUFFERS(
+            base::span(view.values, static_cast<size_t>(view.count)));
+        for (const auto& item : values) {
+          auto name = CopyString(item.name);
+          copy.dict_names.push_back(name.value_or(std::string()));
+          copy.dict_values.push_back(CopyBridgeValue(&item.value));
+        }
+      }
+      break;
+    }
   }
   return copy;
 }
@@ -203,6 +232,11 @@ struct TaggedValueStorage {
   };
   std::string string_value;
   std::vector<uint8_t> binary_value;
+  std::vector<TaggedValueStorage> list_values;
+  std::vector<xlang_bridge_value> list_native_values;
+  std::vector<std::string> dict_names;
+  std::vector<TaggedValueStorage> dict_values;
+  std::vector<xlang_bridge_named_value> dict_native_values;
 
   void RefreshView() {
     if (native.type == XLANG_BRIDGE_VALUE_STRING)
@@ -211,6 +245,37 @@ struct TaggedValueStorage {
       native.data.bytes_value = {
           .data = binary_value.data(),
           .size = static_cast<uint64_t>(binary_value.size()),
+      };
+    }
+    if (native.type == XLANG_BRIDGE_VALUE_LIST) {
+      list_native_values.clear();
+      list_native_values.reserve(list_values.size());
+      for (auto& item : list_values) {
+        item.RefreshView();
+        list_native_values.push_back(item.native);
+      }
+      native.data.list_value = {
+          .values = list_native_values.empty() ? nullptr
+                                               : list_native_values.data(),
+          .count = static_cast<uint32_t>(list_native_values.size()),
+          .reserved = 0,
+      };
+    }
+    if (native.type == XLANG_BRIDGE_VALUE_DICT) {
+      dict_native_values.clear();
+      dict_native_values.reserve(dict_values.size());
+      for (size_t index = 0; index < dict_values.size(); ++index) {
+        dict_values[index].RefreshView();
+        dict_native_values.push_back({
+            .name = BorrowedBytes(dict_names[index]),
+            .value = dict_values[index].native,
+        });
+      }
+      native.data.dict_value = {
+          .values = dict_native_values.empty() ? nullptr
+                                               : dict_native_values.data(),
+          .count = static_cast<uint32_t>(dict_native_values.size()),
+          .reserved = 0,
       };
     }
   }
@@ -300,6 +365,52 @@ bool ReadTaggedValue(v8::Isolate* isolate,
     const auto bytes = electron::Buffer::as_byte_span(value);
     output->binary_value.assign(bytes.begin(), bytes.end());
     output->native.type = XLANG_BRIDGE_VALUE_BINARY;
+  } else if (type == "list") {
+    if (!dictionary.Get("value", &value) || !value->IsArray()) {
+      *error = "XLang list value must contain an array 'value'";
+      return false;
+    }
+    auto context = isolate->GetCurrentContext();
+    auto array = value.As<v8::Array>();
+    output->list_values.resize(array->Length());
+    for (uint32_t index = 0; index < array->Length(); ++index) {
+      v8::Local<v8::Value> item;
+      if (!array->Get(context, index).ToLocal(&item) ||
+          !ReadTaggedValue(isolate, item, &output->list_values[index],
+                           error)) {
+        return false;
+      }
+    }
+    output->native.type = XLANG_BRIDGE_VALUE_LIST;
+  } else if (type == "dict") {
+    if (!dictionary.Get("value", &value) || !value->IsObject() ||
+        value->IsArray()) {
+      *error = "XLang dict value must contain an object 'value'";
+      return false;
+    }
+    auto context = isolate->GetCurrentContext();
+    auto object = value.As<v8::Object>();
+    v8::Local<v8::Array> keys;
+    if (!object->GetOwnPropertyNames(context).ToLocal(&keys)) {
+      *error = "Could not enumerate XLang dict value";
+      return false;
+    }
+    output->dict_names.resize(keys->Length());
+    output->dict_values.resize(keys->Length());
+    for (uint32_t index = 0; index < keys->Length(); ++index) {
+      v8::Local<v8::Value> key;
+      v8::Local<v8::Value> item;
+      if (!keys->Get(context, index).ToLocal(&key) || !key->IsString() ||
+          !object->Get(context, key).ToLocal(&item) ||
+          !gin::ConvertFromV8(isolate, key, &output->dict_names[index]) ||
+          !ReadTaggedValue(isolate, item, &output->dict_values[index],
+                           error)) {
+        if (error->empty())
+          *error = "Could not read an XLang dict entry";
+        return false;
+      }
+    }
+    output->native.type = XLANG_BRIDGE_VALUE_DICT;
   } else if (type == "handle") {
     if (!dictionary.Get("value", &value) ||
         !ReadBigInt(value, &output->native.data.handle_value)) {
@@ -1228,6 +1339,36 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
                        .ToLocalChecked()
                        .As<v8::Value>());
         break;
+      case XLANG_BRIDGE_VALUE_LIST: {
+        result.Set("type", "list");
+        auto context = isolate->GetCurrentContext();
+        auto array =
+            v8::Array::New(isolate, static_cast<int>(value.list_values.size()));
+        for (uint32_t index = 0;
+             index < static_cast<uint32_t>(value.list_values.size());
+             ++index) {
+          array->Set(context, index, ToV8(isolate, value.list_values[index]))
+              .Check();
+        }
+        result.Set("value", array.As<v8::Value>());
+        break;
+      }
+      case XLANG_BRIDGE_VALUE_DICT: {
+        result.Set("type", "dict");
+        auto context = isolate->GetCurrentContext();
+        auto object = v8::Object::New(isolate);
+        for (size_t index = 0; index < value.dict_values.size(); ++index) {
+          object
+              ->DefineOwnProperty(context,
+                                  gin::StringToV8(
+                                      isolate, value.dict_names[index]),
+                                  ToV8(isolate, value.dict_values[index]),
+                                  v8::None)
+              .Check();
+        }
+        result.Set("value", object.As<v8::Value>());
+        break;
+      }
       case XLANG_BRIDGE_VALUE_HANDLE:
         result.Set("type", "handle");
         result.Set("value",
@@ -1271,6 +1412,10 @@ class XLangBridgeBinding : public gin_helper::CleanedUpAtExit {
   void ReleaseIfHandle(const OwnedBridgeValue& value) {
     if (value.type == XLANG_BRIDGE_VALUE_HANDLE && api_.release_handle)
       api_.release_handle(value.handle_value);
+    for (const auto& item : value.list_values)
+      ReleaseIfHandle(item);
+    for (const auto& item : value.dict_values)
+      ReleaseIfHandle(item);
   }
 
   void ReleaseHandles(const std::vector<OwnedBridgeValue>& values) {

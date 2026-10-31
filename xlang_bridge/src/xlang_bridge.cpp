@@ -84,6 +84,9 @@ struct InputValue {
   double double_value = 0.0;
   xlang_bridge_handle handle_value = 0;
   std::vector<uint8_t> bytes;
+  std::vector<InputValue> list_items;
+  std::vector<std::string> dict_names;
+  std::vector<InputValue> dict_values;
 };
 
 struct InputNamedValue {
@@ -125,6 +128,37 @@ bool CopyInputValue(const xlang_bridge_value& source, InputValue& destination) {
     case XLANG_BRIDGE_VALUE_HANDLE:
       destination.handle_value = source.data.handle_value;
       return destination.handle_value != 0;
+    case XLANG_BRIDGE_VALUE_LIST: {
+      const auto view = source.data.list_value;
+      if (view.count != 0 && view.values == nullptr) {
+        return false;
+      }
+      destination.list_items.resize(view.count);
+      for (uint32_t index = 0; index < view.count; ++index) {
+        if (!CopyInputValue(view.values[index],
+                            destination.list_items[index])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    case XLANG_BRIDGE_VALUE_DICT: {
+      const auto view = source.data.dict_value;
+      if (view.count != 0 && view.values == nullptr) {
+        return false;
+      }
+      destination.dict_names.resize(view.count);
+      destination.dict_values.resize(view.count);
+      for (uint32_t index = 0; index < view.count; ++index) {
+        const auto& item = view.values[index];
+        if (!IsRequiredViewValid(item.name) ||
+            !CopyView(item.name, destination.dict_names[index]) ||
+            !CopyInputValue(item.value, destination.dict_values[index])) {
+          return false;
+        }
+      }
+      return true;
+    }
     default:
       return false;
   }
@@ -134,11 +168,20 @@ struct ConvertedValue {
   xlang_bridge_value value{};
   std::string string_storage;
   std::vector<uint8_t> binary_storage;
+  std::vector<std::unique_ptr<ConvertedValue>> children;
+  std::vector<std::string> dict_names;
+  std::vector<xlang_bridge_value> list_values;
+  std::vector<xlang_bridge_named_value> dict_values;
 
   ConvertedValue() {
     value.struct_size = sizeof(value);
     value.type = XLANG_BRIDGE_VALUE_UNDEFINED;
   }
+
+  ConvertedValue(ConvertedValue&&) noexcept = default;
+  ConvertedValue& operator=(ConvertedValue&&) noexcept = default;
+  ConvertedValue(const ConvertedValue&) = delete;
+  ConvertedValue& operator=(const ConvertedValue&) = delete;
 
   void RefreshView() {
     if (value.type == XLANG_BRIDGE_VALUE_STRING) {
@@ -146,6 +189,29 @@ struct ConvertedValue {
     } else if (value.type == XLANG_BRIDGE_VALUE_BINARY) {
       value.data.bytes_value = {binary_storage.data(),
                                 static_cast<uint64_t>(binary_storage.size())};
+    } else if (value.type == XLANG_BRIDGE_VALUE_LIST) {
+      list_values.clear();
+      list_values.reserve(children.size());
+      for (auto& child : children) {
+        child->RefreshView();
+        list_values.push_back(child->value);
+      }
+      value.data.list_value = {
+          list_values.empty() ? nullptr : list_values.data(),
+          static_cast<uint32_t>(list_values.size()),
+          0};
+    } else if (value.type == XLANG_BRIDGE_VALUE_DICT) {
+      dict_values.clear();
+      dict_values.reserve(children.size());
+      for (size_t index = 0; index < children.size(); ++index) {
+        children[index]->RefreshView();
+        dict_values.push_back(
+            {ViewOf(dict_names[index]), children[index]->value});
+      }
+      value.data.dict_value = {
+          dict_values.empty() ? nullptr : dict_values.data(),
+          static_cast<uint32_t>(dict_values.size()),
+          0};
     }
   }
 };
@@ -699,15 +765,19 @@ class Bridge {
             ret_value = X::Value(true);
           });
 
-          auto* event = dynamic_cast<X::XEvent*>(event_value.GetObj());
+          X::XObj* event_object = event_value.GetObj();
+          auto* event = dynamic_cast<X::XEvent*>(event_object);
           if (!event) {
             Complete(request_id, XLANG_BRIDGE_STATUS_EVENT_FAILED, nullptr,
                      "XLang member is not an event");
             return;
           }
-
           Subscription provisional;
-          provisional.event = event_value;
+          if (event_object != nullptr) {
+            event_object->IncRef();
+          }
+          event_value.SetObj(nullptr);
+          provisional.event = X::Value(event_object, false);
           provisional.cookie = 0;
           provisional.callback_lifetime = callback_lifetime;
           {
@@ -722,16 +792,6 @@ class Bridge {
           }
 
           const long cookie = event->AddHandler(std::move(handler));
-          if (cookie == 0) {
-            {
-              std::lock_guard<std::mutex> lock(subscription_mutex_);
-              subscriptions_.erase(subscription_id);
-            }
-            Complete(request_id, XLANG_BRIDGE_STATUS_EVENT_FAILED, nullptr,
-                     TakeException("XLang event subscription failed"));
-            return;
-          }
-
           {
             std::lock_guard<std::mutex> lock(subscription_mutex_);
             const auto found = subscriptions_.find(subscription_id);
@@ -1271,6 +1331,31 @@ class Bridge {
       }
       case XLANG_BRIDGE_VALUE_HANDLE:
         return LookupHandle(input.handle_value, output);
+      case XLANG_BRIDGE_VALUE_LIST: {
+        X::List list;
+        for (const auto& item : input.list_items) {
+          X::Value converted_item;
+          if (!ConvertInput(item, converted_item)) {
+            return false;
+          }
+          list->AddItem(converted_item);
+        }
+        output = X::Value(list);
+        return true;
+      }
+      case XLANG_BRIDGE_VALUE_DICT: {
+        X::Dict dict;
+        for (size_t index = 0; index < input.dict_values.size(); ++index) {
+          X::Value converted_value;
+          if (!ConvertInput(input.dict_values[index], converted_value)) {
+            return false;
+          }
+          X::Value converted_key(input.dict_names[index]);
+          dict->Set(converted_key, converted_value);
+        }
+        output = X::Value(dict);
+        return true;
+      }
       default:
         return false;
     }
@@ -1319,6 +1404,28 @@ class Bridge {
         }
         return converted;
       }
+    }
+    if (input.IsList()) {
+      converted.value.type = XLANG_BRIDGE_VALUE_LIST;
+      X::List list(input);
+      const auto count = static_cast<size_t>(list.size());
+      converted.children.reserve(count);
+      for (size_t index = 0; index < count; ++index) {
+        X::Value item = list[index];
+        converted.children.push_back(
+            std::make_unique<ConvertedValue>(ConvertOutput(item)));
+      }
+      return converted;
+    }
+    if (input.IsDict()) {
+      converted.value.type = XLANG_BRIDGE_VALUE_DICT;
+      X::Dict dict(input);
+      dict->Enum([this, &converted](X::Value& key, X::Value& value) {
+        converted.dict_names.push_back(key.ToString());
+        converted.children.push_back(
+            std::make_unique<ConvertedValue>(ConvertOutput(value)));
+      });
+      return converted;
     }
 
     converted.value.type = XLANG_BRIDGE_VALUE_HANDLE;

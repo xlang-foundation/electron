@@ -32,7 +32,7 @@
 extern "C" {
 #endif
 
-#define XLANG_BRIDGE_ABI_VERSION 2u
+#define XLANG_BRIDGE_ABI_VERSION 3u
 
 typedef uint64_t xlang_bridge_request_id;
 typedef uint64_t xlang_bridge_handle;
@@ -69,14 +69,31 @@ typedef enum xlang_bridge_value_type {
   XLANG_BRIDGE_VALUE_STRING = 5,
   XLANG_BRIDGE_VALUE_BINARY = 6,
   XLANG_BRIDGE_VALUE_HANDLE = 7,
-  XLANG_BRIDGE_VALUE_SUBSCRIPTION = 8
+  XLANG_BRIDGE_VALUE_SUBSCRIPTION = 8,
+  XLANG_BRIDGE_VALUE_LIST = 9,
+  XLANG_BRIDGE_VALUE_DICT = 10
 } xlang_bridge_value_type;
+
+typedef struct xlang_bridge_value xlang_bridge_value;
+typedef struct xlang_bridge_named_value xlang_bridge_named_value;
+
+typedef struct xlang_bridge_value_list_view {
+  const xlang_bridge_value* values;
+  uint32_t count;
+  uint32_t reserved;
+} xlang_bridge_value_list_view;
+
+typedef struct xlang_bridge_value_dict_view {
+  const xlang_bridge_named_value* values;
+  uint32_t count;
+  uint32_t reserved;
+} xlang_bridge_value_dict_view;
 
 /*
  * For HANDLE values, flags contains the numeric X::ObjType. Consumers must
  * treat unknown values as ordinary opaque objects for forward compatibility.
  */
-typedef struct xlang_bridge_value {
+struct xlang_bridge_value {
   uint32_t struct_size;
   uint32_t type;
   uint32_t flags;
@@ -88,13 +105,15 @@ typedef struct xlang_bridge_value {
     xlang_bridge_handle handle_value;
     xlang_bridge_subscription_id subscription_value;
     xlang_bridge_bytes_view bytes_value;
+    xlang_bridge_value_list_view list_value;
+    xlang_bridge_value_dict_view dict_value;
   } data;
-} xlang_bridge_value;
+};
 
-typedef struct xlang_bridge_named_value {
+struct xlang_bridge_named_value {
   xlang_bridge_bytes_view name;
   xlang_bridge_value value;
-} xlang_bridge_named_value;
+};
 
 enum {
   XLANG_BRIDGE_INIT_ENABLE_PYTHON = 1u << 0,

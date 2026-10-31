@@ -6,6 +6,8 @@ export type XLangTaggedValue =
   | { type: 'double'; value: number }
   | { type: 'string'; value: string }
   | { type: 'binary'; value: Buffer }
+  | { type: 'list'; value: XLangTaggedValue[] }
+  | { type: 'dict'; value: Record<string, XLangTaggedValue> }
   | { type: 'handle'; value: bigint; objectType: number };
 
 type XLangNativeEventCallback = (args: XLangTaggedValue[], kwargs: Record<string, XLangTaggedValue>) => void;
@@ -148,6 +150,10 @@ class XLangContext {
       return { type: 'binary', value };
     }
 
+    if (Array.isArray(value)) {
+      return { type: 'list', value: value.map((item) => this.encode(item)) };
+    }
+
     if ((typeof value === 'object' || typeof value === 'function') && value !== null) {
       const core = remoteCoreByObject.get(value);
       if (core !== undefined) {
@@ -163,7 +169,18 @@ class XLangContext {
       }
     }
 
-    throw new TypeError('Unsupported XLang value; expected a scalar, Buffer, bigint, or XLang object');
+    if (typeof value === 'object' && value !== null) {
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype === Object.prototype || prototype === null) {
+        const encoded = Object.create(null) as Record<string, XLangTaggedValue>;
+        for (const [key, item] of Object.entries(value)) {
+          encoded[key] = this.encode(item);
+        }
+        return { type: 'dict', value: encoded };
+      }
+    }
+
+    throw new TypeError('Unsupported XLang value; expected a scalar, Buffer, bigint, array, plain object, or XLang object');
   }
 
   validate(value: XLangTaggedValue): void {
@@ -191,6 +208,14 @@ class XLangContext {
       case 'binary':
         if (!Buffer.isBuffer(value.value)) break;
         return;
+      case 'list':
+        if (!Array.isArray(value.value)) break;
+        for (const item of value.value) this.validate(item);
+        return;
+      case 'dict':
+        if (value.value === null || typeof value.value !== 'object' || Array.isArray(value.value)) break;
+        for (const item of Object.values(value.value)) this.validate(item);
+        return;
       case 'handle':
         if (typeof value.value !== 'bigint' || typeof value.objectType !== 'number') break;
         return;
@@ -216,6 +241,20 @@ class XLangContext {
           return Number(value.value);
         }
         return value.value;
+      case 'list':
+        return value.value.map((item) => this.decode(item));
+      case 'dict': {
+        const decoded = Object.create(null) as Record<string, unknown>;
+        for (const [key, item] of Object.entries(value.value)) {
+          Object.defineProperty(decoded, key, {
+            configurable: true,
+            enumerable: true,
+            value: this.decode(item),
+            writable: true
+          });
+        }
+        return decoded;
+      }
       case 'handle':
         return this.getOrCreateObject(value.value, value.objectType);
     }
@@ -223,11 +262,12 @@ class XLangContext {
 
   releaseUndelivered(values: XLangTaggedValue[]): void {
     const handles = new Set<bigint>();
-    for (const value of values) {
-      if (value?.type === 'handle' && typeof value.value === 'bigint') {
-        handles.add(value.value);
-      }
-    }
+    const collect = (value: XLangTaggedValue): void => {
+      if (value?.type === 'handle' && typeof value.value === 'bigint') handles.add(value.value);
+      if (value?.type === 'list') value.value.forEach(collect);
+      if (value?.type === 'dict') Object.values(value.value).forEach(collect);
+    };
+    for (const value of values) collect(value);
     void Promise.allSettled([...handles].map(async (handle) => this.native.release(handle)));
   }
 

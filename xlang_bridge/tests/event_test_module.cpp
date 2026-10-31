@@ -39,11 +39,11 @@ class BridgeEventTestModule {
   ~BridgeEventTestModule() { JoinBlockedEmission(); }
 
   bool Emit(int number, std::string message) {
-    X::ARGS args(2);
+    X::ARGS args;
     args.push_back(X::Value(number));
     args.push_back(X::Value(message));
 
-    X::KWARGS kwargs(1);
+    X::KWARGS kwargs;
     X::Value source(std::string("native-test-module"));
     kwargs.Add("source", source);
 
